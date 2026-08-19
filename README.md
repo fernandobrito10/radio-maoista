@@ -156,7 +156,49 @@ Erros lançados como `UserError` viram mensagem amigável e efêmera automaticam
 
 `LOG_LEVEL=debug` no `.env` mostra cada chamada do yt-dlp e cada resolução Spotify→YouTube.
 
-## 8. Notas
+## 8. Docker / Raspberry Pi
+
+```bash
+# no Pi, dentro da pasta do projeto (com o .env já preenchido)
+mkdir -p data
+docker compose build
+docker compose run --rm bot npm run doctor    # confere tudo dentro do container
+docker compose run --rm bot npm run deploy    # registra os slash commands (uma vez)
+docker compose up -d
+docker compose logs -f
+```
+
+**Use Pi OS 64 bits.** Em `arm64` a imagem pega o yt-dlp standalone e o deno
+(que o yt-dlp usa pra resolver os *JS challenges* do YouTube). Em `armv7` nenhum
+dos dois existe: o Dockerfile cai no `pip install yt-dlp` e o yt-dlp fica com o
+interpretador de JS interno, que quebra mais fácil. Funciona, mas é o caminho ruim.
+
+**Como a imagem é montada** (multi-stage, pra não carregar toolchain na final):
+1. `deps` — instala as dependências com `python3/make/g++` disponíveis, porque o
+   `@discordjs/opus` compila quando não há prebuild pra arquitetura
+2. `tools` — baixa yt-dlp e deno conforme a arquitetura
+3. `runtime` — só node_modules + `src/`, rodando como usuário `node`
+
+**Persistência:** `./data` é bind-mountado em `/app/data` e guarda as *session keys*
+do Last.fm. Se der erro de permissão, o dono precisa ser o uid 1000:
+`sudo chown -R 1000:1000 data`.
+
+**Atualizações:** o entrypoint roda `yt-dlp -U` a cada boot — é o que conserta as
+quebras do YouTube sem rebuild. Desligue com `YTDLP_AUTO_UPDATE=0`. Para atualizar o
+bot em si: `git pull && docker compose up -d --build`.
+
+**Rede:** o bot é só saída (nada de `EXPOSE`), mas voz precisa de **UDP de saída**.
+A bridge padrão do Docker resolve via NAT; se a voz travar em `connecting`, teste com
+`network_mode: host` pra descartar o NAT.
+
+**ffmpeg:** vem do `ffmpeg-static` dentro de `node_modules` (arm64 e arm publicados),
+economizando ~150 MB. Se ele falhar na sua arquitetura, descomente as duas linhas de
+`ffmpeg` no [Dockerfile](Dockerfile) pra usar o do apt.
+
+O `init: true` do compose existe porque o bot spawna um `yt-dlp` por faixa: garante
+que o `SIGTERM` chegue e que não sobre processo zumbi.
+
+## 9. Notas
 
 - `data/users.json` guarda *session keys* do Last.fm — é credencial de usuário, já está no `.gitignore`. Não commite.
 - O bot sai do canal depois de `IDLE_TIMEOUT` segundos (padrão 180) com a fila vazia ou o canal vazio.

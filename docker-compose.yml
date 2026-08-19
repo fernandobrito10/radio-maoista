@@ -1,0 +1,26 @@
+services:
+  bot:
+    build: .
+    image: radio-maoista
+    container_name: radio-maoista
+    restart: unless-stopped
+    # PID 1 que reap zombie e repassa SIGTERM: o bot spawna um yt-dlp por faixa
+    init: true
+    env_file: .env
+    environment:
+      # fixa o caminho do binario dentro da imagem, ignorando o do .env
+      YTDLP_PATH: /usr/local/bin/yt-dlp
+      # 0 desliga o "yt-dlp -U" a cada boot
+      YTDLP_AUTO_UPDATE: "1"
+      # 1 registra os slash commands ao subir (deixe 0 no dia a dia)
+      DEPLOY_COMMANDS_ON_START: "0"
+      TZ: America/Sao_Paulo
+    volumes:
+      # session keys do Last.fm — precisa persistir entre recriacoes
+      - ./data:/app/data
+    # SD card nao gosta de log infinito
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
