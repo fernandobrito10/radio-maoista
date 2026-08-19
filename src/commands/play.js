@@ -1,0 +1,76 @@
+import { SlashCommandBuilder } from 'discord.js';
+import { manager } from '../core/PlayerManager.js';
+import { resolveQuery } from '../core/resolver.js';
+import { requireVoiceChannel } from '../utils/guards.js';
+import { addedPlaylistEmbed, addedTrackEmbed, errorEmbed } from '../utils/embeds.js';
+
+export const data = new SlashCommandBuilder()
+  .setName('play')
+  .setDescription('Toca uma musica: nome, link do YouTube ou link do Spotify (faixa/album/playlist)')
+  .addStringOption((o) => o
+    .setName('busca')
+    .setDescription('Nome da musica, link do YouTube ou link do Spotify')
+    .setRequired(true)
+    .setMaxLength(500))
+  .addBooleanOption((o) => o
+    .setName('agora')
+    .setDescription('Coloca no topo da fila em vez do fim'));
+
+export async function execute(interaction) {
+  const voiceChannel = requireVoiceChannel(interaction);
+  await interaction.deferReply();
+
+  const query = interaction.options.getString('busca', true);
+  const playNext = interaction.options.getBoolean('agora') ?? false;
+
+  const result = await resolveQuery(query, { requestedBy: interaction.user.id });
+
+  const queue = await manager.ensure({
+    guild: interaction.guild,
+    voiceChannel,
+    textChannel: interaction.channel,
+  });
+
+  const startingNow = !queue.current && !queue.isPlaying && !queue.isPaused;
+  const isSingle = result.tracks.length === 1;
+
+  const added = queue.add(result.tracks, { next: playNext });
+  if (added === 0) {
+    await interaction.editReply({ embeds: [errorEmbed('A fila esta cheia, nao cabe mais nada.')] });
+    return;
+  }
+  queue.cancelLeave();
+
+  // faixa unica que ja vai tocar: o embed de "tocando agora" vira a propria resposta
+  if (isSingle && startingNow) {
+    queue.useResponder(async (embed) => {
+      await interaction.editReply({ embeds: [embed] });
+    });
+  }
+
+  if (!isSingle) {
+    const totalMs = result.tracks.slice(0, added).reduce((sum, t) => sum + (t.durationMs || 0), 0);
+    const skipped = result.tracks.length - added;
+    const embed = addedPlaylistEmbed({
+      name: result.playlistName ?? 'Playlist',
+      url: result.playlistUrl,
+      count: added,
+      totalMs,
+      kind: result.kind,
+    });
+    if (skipped > 0) embed.setFooter({ text: `${skipped} faixa(s) ficaram de fora: fila cheia.` });
+    await interaction.editReply({ embeds: [embed] });
+  } else if (!startingNow) {
+    const track = result.tracks[0];
+    const position = playNext ? 1 : queue.tracks.indexOf(track) + 1;
+    await interaction.editReply({ embeds: [addedTrackEmbed(track, { position })] });
+  }
+
+  await queue.start();
+
+  // se nada foi anunciado (ex.: ja estava tocando), garante uma resposta
+  if (queue.hasPendingResponder) {
+    queue.clearResponder();
+    await interaction.editReply({ embeds: [addedTrackEmbed(result.tracks[0], { position: 0 })] });
+  }
+}
