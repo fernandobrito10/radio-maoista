@@ -38,12 +38,18 @@ RUN set -eux; \
     esac; \
     if [ -n "$ytdlp" ]; then \
       curl -fsSL -o /out/yt-dlp "https://github.com/yt-dlp/yt-dlp/releases/latest/download/${ytdlp}"; \
+      curl -fsSL -o /tmp/SUMS "https://github.com/yt-dlp/yt-dlp/releases/latest/download/SHA2-256SUMS"; \
+      esperado="$(awk -v f="$ytdlp" '$2 == f { print $1 }' /tmp/SUMS)"; \
+      [ -n "$esperado" ] || { echo "checksum de $ytdlp nao encontrado" >&2; exit 1; }; \
+      echo "$esperado  /out/yt-dlp" | sha256sum -c -; \
       chmod +x /out/yt-dlp; \
     else \
       echo "sem build standalone de yt-dlp para $arch: a imagem final instala via pip"; \
     fi; \
     if [ -n "$deno" ]; then \
       curl -fsSL -o /tmp/deno.zip "https://github.com/denoland/deno/releases/latest/download/${deno}.zip"; \
+      curl -fsSL -o /tmp/deno.sha "https://github.com/denoland/deno/releases/latest/download/${deno}.zip.sha256sum"; \
+      echo "$(awk '{ print $1 }' /tmp/deno.sha)  /tmp/deno.zip" | sha256sum -c -; \
       unzip -q /tmp/deno.zip -d /out; \
       chmod +x /out/deno; \
       rm /tmp/deno.zip; \
@@ -64,6 +70,7 @@ FROM node:22-bookworm-slim
 
 ENV NODE_ENV=production \
     YTDLP_PATH=/usr/local/bin/yt-dlp \
+    LIVENESS_FILE=/tmp/alive \
     NPM_CONFIG_UPDATE_NOTIFIER=false
 
 WORKDIR /app
@@ -94,7 +101,12 @@ RUN chmod +x /usr/local/bin/entrypoint.sh \
  && chown node:node /usr/local/bin/yt-dlp
 
 USER node
-VOLUME ["/app/data"]
+
+# "Processo vivo" nao e o mesmo que "bot funcionando": com o gateway morto por
+# token/intent invalido o Node continua de pe. O arquivo de liveness so e tocado
+# enquanto o shard esta Ready, entao o healthcheck enxerga o zumbi.
+HEALTHCHECK --interval=60s --timeout=10s --start-period=90s --retries=3 \
+  CMD node -e "const{statSync}=require('node:fs');const m=statSync(process.env.LIVENESS_FILE).mtimeMs;process.exit(Date.now()-m<180000?0:1)"
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["node", "src/index.js"]

@@ -2,6 +2,7 @@ import {
   AudioPlayerStatus,
   NoSubscriberBehavior,
   StreamType,
+  VoiceConnectionDisconnectReason,
   VoiceConnectionStatus,
   createAudioPlayer,
   createAudioResource,
@@ -16,6 +17,17 @@ import { errorEmbed, nowPlayingEmbed } from '../utils/embeds.js';
 import { log } from '../utils/logger.js';
 
 export const LoopMode = { OFF: 'off', TRACK: 'track', QUEUE: 'queue' };
+
+/** Depois de N falhas seguidas para tudo: com 1000 faixas quebradas seriam 1000 mensagens. */
+const MAX_FAILURE_STREAK = 5;
+
+/** Carregamento abortado por skip/stop/destroy - nao e erro, nao merece aviso. */
+class PlaybackCancelled extends Error {
+  constructor() {
+    super('carregamento cancelado');
+    this.name = 'PlaybackCancelled';
+  }
+}
 
 /** Traduz o estado onde a conexao de voz travou na causa mais provavel. */
 function connectionTimeoutHint(status) {
@@ -34,7 +46,13 @@ export class GuildQueue {
   #idleTimer = null;
   #scrobbleTimer = null;
   #advancing = false;
+  #advanceRequested = false;
   #responder = null;
+  /** Muda a cada faixa; carregamento com geracao velha e descartado. */
+  #generation = 0;
+  #failureStreak = 0;
+  /** Canal sem humanos: o relogio de saida nao pode ser zerado por troca de faixa. */
+  #alone = false;
 
   constructor({ guild, voiceChannel, textChannel, onDestroy }) {
     this.guild = guild;
@@ -70,6 +88,14 @@ export class GuildQueue {
       if (this.connection.joinConfig.channelId !== voiceChannel.id) {
         this.connection.rejoin({ channelId: voiceChannel.id, selfDeaf: true, selfMute: false });
       }
+      // A conexao pode estar em Signalling/Connecting depois de um blip. Devolver
+      // sem esperar fazia o bot "tocar" com os frames indo pro vazio.
+      try {
+        await entersState(this.connection, VoiceConnectionStatus.Ready, 20_000);
+      } catch {
+        this.destroy();
+        throw new Error('a conexao de voz nao voltou a ficar pronta a tempo.');
+      }
       return this.connection;
     }
 
@@ -80,17 +106,36 @@ export class GuildQueue {
       selfDeaf: true,
     });
 
-    connection.on(VoiceConnectionStatus.Disconnected, async () => {
-      try {
-        // pode ser so um move de canal: espera reconectar antes de desistir
-        await Promise.race([
-          entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
-          entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
-        ]);
-      } catch {
-        log.info(`[${this.guild.name}] desconectado do canal de voz, encerrando sessao.`);
-        this.destroy();
+    connection.on(VoiceConnectionStatus.Disconnected, async (_oldState, newState) => {
+      const closeCode = newState.reason === VoiceConnectionDisconnectReason.WebSocketClose
+        ? newState.closeCode
+        : null;
+
+      // 4014 = kickado/movido ou canal apagado. Pode voltar sozinho num move.
+      if (closeCode === 4014) {
+        try {
+          await entersState(connection, VoiceConnectionStatus.Connecting, 5_000);
+        } catch {
+          log.info(`[${this.guild.name}] removido do canal de voz, encerrando sessao.`);
+          this.destroy();
+        }
+        return;
       }
+
+      // 4006 (sessao de voz invalidada) e o modo de falha classico de bot 24/7.
+      // Antes caia no catch generico e destruia a fila inteira de madrugada.
+      if (connection.rejoinAttempts < 5) {
+        const espera = (connection.rejoinAttempts + 1) * 3_000;
+        log.warn(`[${this.guild.name}] voz caiu (codigo ${closeCode ?? 'sem codigo'}), `
+          + `tentativa ${connection.rejoinAttempts + 1}/5 em ${espera}ms`);
+        await new Promise((resolve) => setTimeout(resolve, espera));
+        if (this.destroyed || connection.state.status === VoiceConnectionStatus.Destroyed) return;
+        connection.rejoin();
+        return;
+      }
+
+      log.info(`[${this.guild.name}] nao consegui reconectar a voz em 5 tentativas, encerrando.`);
+      this.destroy();
     });
 
     connection.on('error', (err) => log.warn(`[${this.guild.name}] erro na conexao de voz: ${err.message}`));
@@ -182,7 +227,16 @@ export class GuildQueue {
 
   skip() {
     const skipped = this.current;
-    this.player.stop(true);
+    // Invalida o carregamento em voo. Sem isto, um /skip nos ~3s entre "faixa
+    // escolhida" e "audio tocando" nao fazia nada: player.stop() num player Idle
+    // devolve false, e a faixa supostamente pulada comecava a tocar logo depois.
+    this.#generation += 1;
+    this.#killStream();
+    if (!this.player.stop(true)) {
+      // nada tocando ainda: o evento Idle nao vem, entao avanca na mao
+      this.current = null;
+      void this.#advance();
+    }
     return skipped;
   }
 
@@ -190,7 +244,9 @@ export class GuildQueue {
 
   #wirePlayer() {
     this.player.on(AudioPlayerStatus.Playing, () => {
-      this.#clearIdleTimer();
+      // Se o canal esta vazio o relogio continua correndo: senao cada faixa nova
+      // zerava a contagem e o bot tocava a madrugada inteira pra ninguem.
+      if (!this.#alone) this.#clearIdleTimer();
     });
 
     this.player.on(AudioPlayerStatus.Idle, () => {
@@ -217,44 +273,86 @@ export class GuildQueue {
     return this.tracks.shift() ?? null;
   }
 
+  /**
+   * Laco (nao recursao) de avanco da fila. Reentrancia vira pedido, nao chamada
+   * aninhada - antes, uma fila inteira de faixas quebradas empilhava um frame
+   * async e uma mensagem no canal por faixa.
+   */
   async #advance() {
-    if (this.destroyed || this.#advancing) return;
-    this.#advancing = true;
-    let failed = false;
-    try {
-      const next = this.#nextTrack();
-      if (!next) {
-        this.current = null;
-        this.#scheduleIdleLeave('fila vazia');
-        return;
-      }
-      this.current = next;
-      await this.#playTrack(next);
-    } catch (err) {
-      failed = true;
-      log.warn(`[${this.guild.name}] falha ao tocar: ${err.message}`);
-      await this.#announce(errorEmbed(`Nao consegui tocar **${this.current?.title ?? 'a faixa'}**: ${err.message}`));
-    } finally {
-      this.#advancing = false;
+    if (this.destroyed) return;
+    if (this.#advancing) {
+      this.#advanceRequested = true;
+      return;
     }
 
-    if (!failed || this.destroyed) return;
+    this.#advancing = true;
+    try {
+      do {
+        this.#advanceRequested = false;
 
-    // faixa quebrada: descarta ela (nem repete, nem volta pro fim da fila) e tenta a proxima
-    if (this.loop === LoopMode.TRACK) this.loop = LoopMode.OFF;
-    this.current = null;
-    if (this.tracks.length) {
-      await this.#advance();
-    } else {
-      this.#scheduleIdleLeave('fila vazia');
+        const next = this.#nextTrack();
+        if (!next) {
+          this.current = null;
+          this.#scheduleIdleLeave('fila vazia');
+          return;
+        }
+
+        this.current = next;
+        try {
+          await this.#playTrack(next);
+          this.#failureStreak = 0;
+          return;
+        } catch (err) {
+          // quem cancelou (skip/stop/destroy) decide o proximo passo
+          if (err instanceof PlaybackCancelled) return;
+
+          this.#failureStreak += 1;
+          log.warn(`[${this.guild.name}] falha ao tocar (${this.#failureStreak}): ${err.message}`);
+          if (this.loop === LoopMode.TRACK) this.loop = LoopMode.OFF;
+          this.current = null;
+
+          if (this.#failureStreak >= MAX_FAILURE_STREAK) {
+            const descartadas = this.clear();
+            this.#failureStreak = 0;
+            await this.#announce(errorEmbed(
+              `${MAX_FAILURE_STREAK} faixas seguidas falharam - ultimo erro: ${err.message}`
+              + `\nParei por aqui e descartei ${descartadas} faixa(s) da fila. `
+              + 'Costuma ser yt-dlp desatualizado ou bloqueio do YouTube.',
+            ));
+            this.#scheduleIdleLeave('falhas seguidas');
+            return;
+          }
+
+          await this.#announce(errorEmbed(`Nao consegui tocar **${next.title}**: ${err.message}`));
+          if (!this.tracks.length) {
+            this.#scheduleIdleLeave('fila vazia');
+            return;
+          }
+          this.#advanceRequested = true;
+        }
+      } while (this.#advanceRequested && !this.destroyed);
+    } finally {
+      this.#advancing = false;
     }
   }
 
   async #playTrack(track) {
+    // Cada await abaixo e uma janela em que /skip, /stop ou destroy() podem chegar.
+    // Sem esta checagem o bot seguia carregando faixa ja cancelada, deixava o
+    // yt-dlp baixando ate 25s depois do /stop e ainda anunciava erro fantasma.
+    const generation = ++this.#generation;
+    const stillValid = () => !this.destroyed && generation === this.#generation;
+
     await ensurePlayable(track);
+    if (!stillValid()) throw new PlaybackCancelled();
+
     this.#killStream();
 
     const source = await openAudioStream(track.url);
+    if (!stillValid()) {
+      source.kill();
+      throw new PlaybackCancelled();
+    }
     this.ytProcess = source;
 
     const resource = createAudioResource(source.stream, {
@@ -274,7 +372,13 @@ export class GuildQueue {
       await entersState(this.player, AudioPlayerStatus.Playing, 25_000);
     } catch {
       source.kill();
+      if (!stillValid()) throw new PlaybackCancelled();
       throw new Error('o audio nao comecou a tocar (timeout do yt-dlp/ffmpeg).');
+    }
+
+    if (!stillValid()) {
+      source.kill();
+      throw new PlaybackCancelled();
     }
 
     await this.#announce(nowPlayingEmbed(track, {
@@ -285,6 +389,19 @@ export class GuildQueue {
 
     void scrobbler.nowPlaying(track, this.voiceChannel).catch(() => {});
     this.#startScrobbleWatch(track);
+    this.#prefetchNext();
+  }
+
+  /**
+   * Resolve a URL da proxima faixa enquanto a atual toca. Sem isso, faixas vindas
+   * do Spotify pagam uma busca no YouTube (~2s) na troca de musica.
+   */
+  #prefetchNext() {
+    const next = this.tracks[0];
+    if (!next || next.url) return;
+    void ensurePlayable(next)
+      .then(() => log.debug(`[${this.guild.name}] prefetch pronto: ${next.title}`))
+      .catch((err) => log.debug(`[${this.guild.name}] prefetch falhou (${next.title}): ${err.message}`));
   }
 
   #startScrobbleWatch(track) {
@@ -341,10 +458,16 @@ export class GuildQueue {
    */
   useResponder(fn) {
     this.#responder = fn;
+    return fn;
   }
 
   get hasPendingResponder() {
     return this.#responder !== null;
+  }
+
+  /** O responder pendente e este? Evita um /play consumir a resposta de outro. */
+  isResponder(fn) {
+    return this.#responder === fn && fn != null;
   }
 
   clearResponder() {
@@ -385,12 +508,21 @@ export class GuildQueue {
     }, config.player.idleTimeoutMs);
   }
 
-  scheduleLeaveIfAlone() {
-    this.#scheduleIdleLeave('canal vazio');
+  /**
+   * Chamado a cada evento de voz do servidor. So reage a MUDANCA de estado -
+   * antes, qualquer pessoa entrando em qualquer canal reiniciava a contagem e o
+   * bot nunca saia de um canal vazio num servidor movimentado.
+   */
+  setAlone(alone) {
+    if (alone === this.#alone) return;
+    this.#alone = alone;
+    if (alone) this.#scheduleIdleLeave('canal vazio');
+    else this.#clearIdleTimer();
   }
 
   cancelLeave() {
-    if (this.current || this.tracks.length) this.#clearIdleTimer();
+    if (this.#alone) return;
+    this.#clearIdleTimer();
   }
 
   stop() {
@@ -402,6 +534,7 @@ export class GuildQueue {
   destroy() {
     if (this.destroyed) return;
     this.destroyed = true;
+    this.#generation += 1;
     this.#clearIdleTimer();
     this.#stopScrobbleWatch();
     this.tracks = [];

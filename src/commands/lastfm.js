@@ -120,21 +120,21 @@ async function handleLink(interaction) {
 }
 
 async function handleUnlink(interaction) {
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
   const removed = await userStore.unlinkLastfm(interaction.user.id);
-  await interaction.reply({
+  await interaction.editReply({
     embeds: [removed
       ? okEmbed('🔌 Desconectei sua conta do Last.fm. Nada mais sera scrobblado.')
       : errorEmbed('Voce nao tem nenhuma conta do Last.fm conectada.')],
-    flags: MessageFlags.Ephemeral,
   });
 }
 
 async function handleStatus(interaction) {
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
   const link = await userStore.getLastfm(interaction.user.id);
   if (!link) {
-    await interaction.reply({
+    await interaction.editReply({
       embeds: [errorEmbed('Sem conta conectada. Use `/lastfm link`.')],
-      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -151,18 +151,18 @@ async function handleStatus(interaction) {
     // status do perfil e opcional
   }
 
-  await interaction.reply({ embeds: [okEmbed(lines.join('\n'))], flags: MessageFlags.Ephemeral });
+  await interaction.editReply({ embeds: [okEmbed(lines.join('\n'))] });
 }
 
 async function handleScrobbleToggle(interaction) {
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
   const active = interaction.options.getBoolean('ativo', true);
   const changed = await userStore.setScrobbling(interaction.user.id, active);
-  await interaction.reply({
+  await interaction.editReply({
     embeds: [changed
       ? okEmbed(active
         ? '✅ Scrobble **ligado**. Vou registrar as musicas que tocarem enquanto voce estiver no canal.'
         : '⛔ Scrobble **desligado**. Sua conta continua conectada.')
       : errorEmbed('Voce precisa conectar sua conta primeiro com `/lastfm link`.')],
-    flags: MessageFlags.Ephemeral,
   });
 }

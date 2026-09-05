@@ -3,6 +3,8 @@ import { log } from '../utils/logger.js';
 
 const TOKEN_URL = 'https://accounts.spotify.com/api/token';
 const API = 'https://api.spotify.com/v1';
+/** Sem timeout o undici espera ate 300s e a interacao do Discord morre antes. */
+const TIMEOUT_MS = 8_000;
 
 const URL_RE = /(?:open\.spotify\.com\/(?:intl-[a-z]{2}\/)?(track|album|playlist|artist)\/([A-Za-z0-9]+))|(?:spotify:(track|album|playlist|artist):([A-Za-z0-9]+))/i;
 
@@ -39,6 +41,7 @@ class SpotifyClient {
           'Content-Type': 'application/x-www-form-urlencoded',
         },
         body: 'grant_type=client_credentials',
+        signal: AbortSignal.timeout(TIMEOUT_MS),
       });
       if (!res.ok) {
         throw new SpotifyError(`Falha ao autenticar no Spotify (${res.status}). Confira SPOTIFY_CLIENT_ID/SECRET.`);
@@ -60,7 +63,10 @@ class SpotifyClient {
     }
 
     for (let attempt = 0; attempt < 3; attempt += 1) {
-      const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+      const res = await fetch(url, {
+        headers: { Authorization: `Bearer ${token}` },
+        signal: AbortSignal.timeout(TIMEOUT_MS),
+      });
 
       if (res.status === 429) {
         const wait = (Number(res.headers.get('retry-after')) || 1) * 1000;

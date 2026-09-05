@@ -16,7 +16,7 @@ export async function loadCommands() {
       log.warn(`Ignorando ${file}: precisa exportar "data" e "execute".`);
       continue;
     }
-    commands.push({ name: mod.data.name, data: mod.data, execute: mod.execute });
+    commands.push({ name: mod.data.name, data: mod.data, execute: mod.execute, autocomplete: mod.autocomplete });
   }
 
   commands.sort((a, b) => a.name.localeCompare(b.name));

@@ -1,6 +1,7 @@
 import { SlashCommandBuilder } from 'discord.js';
 import { manager } from '../core/PlayerManager.js';
 import { resolveQuery } from '../core/resolver.js';
+import { suggestTracks } from '../core/suggest.js';
 import { requireVoiceChannel } from '../utils/guards.js';
 import { addedPlaylistEmbed, addedTrackEmbed, errorEmbed } from '../utils/embeds.js';
 
@@ -11,7 +12,8 @@ export const data = new SlashCommandBuilder()
     .setName('busca')
     .setDescription('Nome da musica, link do YouTube ou link do Spotify')
     .setRequired(true)
-    .setMaxLength(500))
+    .setMaxLength(500)
+    .setAutocomplete(true))
   .addBooleanOption((o) => o
     .setName('agora')
     .setDescription('Coloca no topo da fila em vez do fim'));
@@ -42,8 +44,9 @@ export async function execute(interaction) {
   queue.cancelLeave();
 
   // faixa unica que ja vai tocar: o embed de "tocando agora" vira a propria resposta
+  let responder = null;
   if (isSingle && startingNow) {
-    queue.useResponder(async (embed) => {
+    responder = queue.useResponder(async (embed) => {
       await interaction.editReply({ embeds: [embed] });
     });
   }
@@ -68,9 +71,17 @@ export async function execute(interaction) {
 
   await queue.start();
 
-  // se nada foi anunciado (ex.: ja estava tocando), garante uma resposta
-  if (queue.hasPendingResponder) {
+  // Garante uma resposta se nada foi anunciado — mas so se o responder pendente
+  // ainda for o NOSSO. Dois /play simultaneos consumiam a resposta um do outro e
+  // deixavam a primeira interacao pendurada em "pensando...".
+  if (responder && queue.isResponder(responder)) {
     queue.clearResponder();
     await interaction.editReply({ embeds: [addedTrackEmbed(result.tracks[0], { position: 0 })] });
   }
+}
+
+// Sugestoes enquanto a pessoa digita. O valor escolhido ja e a URL do YouTube,
+// entao o execute() acima nao precisa buscar de novo.
+export function autocomplete(interaction) {
+  return suggestTracks(interaction);
 }

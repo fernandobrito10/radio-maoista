@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { log } from '../utils/logger.js';
@@ -12,28 +12,58 @@ const dataFile = path.join(dataDir, 'users.json');
  */
 class UserStore {
   #cache = null;
+  #loading = null;
   #writeChain = Promise.resolve();
 
   async #load() {
     if (this.#cache) return this.#cache;
-    try {
-      const raw = await readFile(dataFile, 'utf8');
-      this.#cache = JSON.parse(raw);
-    } catch (err) {
-      if (err.code !== 'ENOENT') log.warn('Falha lendo users.json, comecando vazio:', err.message);
-      this.#cache = {};
-    }
-    return this.#cache;
+    // Sem deduplicar, duas chamadas concorrentes no primeiro uso liam o arquivo
+    // duas vezes e a segunda sobrescrevia a mutacao que a primeira ja fizera.
+    this.#loading ??= (async () => {
+      try {
+        const raw = await readFile(dataFile, 'utf8');
+        this.#cache = JSON.parse(raw);
+      } catch (err) {
+        if (err.code !== 'ENOENT') log.warn('Falha lendo users.json, comecando vazio:', err.message);
+        this.#cache = {};
+      }
+      await this.#cleanOrphanTmp();
+      return this.#cache;
+    })().finally(() => { this.#loading = null; });
+
+    return this.#loading;
   }
 
+  /** Um SIGKILL entre o writeFile e o rename deixa um .tmp com todas as chaves. */
+  async #cleanOrphanTmp() {
+    try {
+      const files = await readdir(dataDir);
+      await Promise.all(files
+        .filter((f) => f.startsWith('users.json.') && f.endsWith('.tmp'))
+        .map((f) => rm(path.join(dataDir, f), { force: true })));
+    } catch {
+      // pasta pode nem existir ainda
+    }
+  }
+
+  /**
+   * Escrita atomica e serializada. A falha PRECISA chegar em quem chamou: antes,
+   * o catch ficava dentro da cadeia devolvida, entao o /lastfm link respondia
+   * "conectado" mesmo quando o disco recusou — e a session key sumia no restart.
+   * O caso real e o bind mount ./data pertencendo a outro uid que nao o do container.
+   *
+   * Modo 0600/0700 porque isto guarda session key de Last.fm, que nao expira.
+   */
   #flush() {
     const snapshot = JSON.stringify(this.#cache, null, 2);
-    this.#writeChain = this.#writeChain.then(async () => {
-      await mkdir(dataDir, { recursive: true });
-      const tmp = `${dataFile}.${process.pid}.tmp`;
-      await writeFile(tmp, snapshot, 'utf8');
-      await rename(tmp, dataFile);
-    }).catch((err) => log.error('Falha salvando users.json:', err));
+    this.#writeChain = this.#writeChain
+      .catch(() => {})
+      .then(async () => {
+        await mkdir(dataDir, { recursive: true, mode: 0o700 });
+        const tmp = `${dataFile}.${process.pid}.tmp`;
+        await writeFile(tmp, snapshot, { encoding: 'utf8', mode: 0o600 });
+        await rename(tmp, dataFile);
+      });
     return this.#writeChain;
   }
 

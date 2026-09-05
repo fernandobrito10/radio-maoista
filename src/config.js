@@ -30,6 +30,11 @@ export const config = {
     cookiesFromBrowser: str('YTDLP_COOKIES_FROM_BROWSER'),
     cookiesFile: str('YTDLP_COOKIES_FILE'),
     extraArgs: str('YTDLP_EXTRA_ARGS').split(' ').filter(Boolean),
+    // Teto de banda por faixa. O audio precisa de ~25 KB/s; sem teto o yt-dlp
+    // baixa na velocidade maxima do link e satura a conexao a cada musica.
+    limitRate: str('YTDLP_LIMIT_RATE', '128K'),
+    // Teto de processos yt-dlp simultaneos para busca/metadados (streams nao contam)
+    maxConcurrent: int('YTDLP_MAX_CONCURRENT', 2),
     // Clients do YouTube tentados em ordem ate um entregar audio de verdade.
     // O padrao do yt-dlp (android_vr) anda devolvendo 403 na midia; "android" funciona.
     playerClients: str('YTDLP_PLAYER_CLIENTS', 'android,default')
@@ -37,12 +42,25 @@ export const config = {
       .map((c) => c.trim())
       .filter(Boolean),
   },
+  autocomplete: {
+    // Cada tecla digitada gera uma interacao; o debounce evita uma busca por tecla.
+    // debounce + busca precisa caber nos 3s de validade do token da interacao.
+    debounceMs: int('AUTOCOMPLETE_DEBOUNCE', 300),
+    results: Math.min(24, int('AUTOCOMPLETE_RESULTS', 8)),
+    searchTimeoutMs: int('AUTOCOMPLETE_TIMEOUT', 1500),
+    // Esquenta a busca do yt-dlp em background enquanto a pessoa escolhe.
+    // Desligue (0) se a CPU do Pi sofrer: o /play volta a buscar na hora.
+    prefetch: str('AUTOCOMPLETE_PREFETCH', '1') !== '0',
+  },
   player: {
     defaultVolume: Math.min(100, Math.max(0, int('DEFAULT_VOLUME', 70))),
     idleTimeoutMs: int('IDLE_TIMEOUT', 180) * 1000,
     maxQueueSize: int('MAX_QUEUE_SIZE', 1000),
   },
 };
+
+/** LOG_GATEWAY=1 mostra heartbeat/resume/close do websocket (diagnostico de reconexao). */
+export const logGateway = str('LOG_GATEWAY', '0') === '1';
 
 export const features = {
   get spotify() {

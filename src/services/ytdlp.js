@@ -7,6 +7,32 @@ const AUDIO_FORMAT = 'bestaudio[acodec=opus]/bestaudio[ext=m4a]/bestaudio/best';
 
 const BASE_ARGS = ['--ignore-config', '--no-warnings', '--no-color', '--no-progress'];
 
+/**
+ * Fila de concorrencia para as chamadas curtas (busca e metadados).
+ *
+ * Cada spawn do yt-dlp standalone descompacta dezenas de MB e come ~1,1s de CPU.
+ * O autocomplete dispara um por pausa na digitacao, e o cache so casa queries
+ * identicas — entao alguem digitando rapido gerava uma rajada de processos capaz
+ * de travar o event loop (e, com ele, o heartbeat do gateway) num Raspberry Pi.
+ * Os streams de audio nao passam por aqui: sao longos e limitados pelo nº de filas.
+ */
+const maxConcurrent = Math.max(1, config.ytdlp.maxConcurrent);
+let running = 0;
+const waiting = [];
+
+async function acquireSlot() {
+  if (running >= maxConcurrent) {
+    await new Promise((resolve) => waiting.push(resolve));
+  }
+  running += 1;
+}
+
+function releaseSlot() {
+  running -= 1;
+  const next = waiting.shift();
+  if (next) next();
+}
+
 function cookieArgs() {
   const args = [];
   if (config.ytdlp.cookiesFromBrowser) args.push('--cookies-from-browser', config.ytdlp.cookiesFromBrowser);
@@ -24,7 +50,16 @@ export class YtDlpError extends Error {
 }
 
 /** Roda o yt-dlp e devolve o stdout completo (pra chamadas de metadados). */
-function run(args, { timeoutMs = 60_000 } = {}) {
+async function run(args, options = {}) {
+  await acquireSlot();
+  try {
+    return await runUnthrottled(args, options);
+  } finally {
+    releaseSlot();
+  }
+}
+
+function runUnthrottled(args, { timeoutMs = 60_000 } = {}) {
   const finalArgs = [...BASE_ARGS, ...cookieArgs(), ...config.ytdlp.extraArgs, ...args];
   log.debug('yt-dlp', finalArgs.join(' '));
 
@@ -133,13 +168,13 @@ export async function checkAvailable() {
 }
 
 /** Busca no YouTube e devolve N resultados (rapido, sem resolver formatos). */
-export async function search(query, limit = 1) {
+export async function search(query, limit = 1, { timeoutMs = 30_000 } = {}) {
   const stdout = await run([
     '--flat-playlist',
     '--dump-json',
     '--playlist-end', String(limit),
     `ytsearch${limit}:${query}`,
-  ], { timeoutMs: 30_000 });
+  ], { timeoutMs });
 
   return parseJsonLines(stdout)
     .filter((e) => e.id)
@@ -185,6 +220,7 @@ function openWithClient(url, client, { firstByteTimeoutMs = 20_000 } = {}) {
     ...config.ytdlp.extraArgs,
     '--no-playlist',
     '--no-part',
+    ...(config.ytdlp.limitRate ? ['--limit-rate', config.ytdlp.limitRate] : []),
     '-f', AUDIO_FORMAT,
     '-o', '-',
     url,

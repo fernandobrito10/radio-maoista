@@ -22,9 +22,15 @@ export function truncate(text, max = 60) {
   return clean.length <= max ? clean : `${clean.slice(0, max - 1)}…`;
 }
 
-/** Escapa markdown pra titulo de musica nao virar italico/negrito no embed. */
+/**
+ * Escapa markdown pra titulo de musica nao virar italico/negrito no embed.
+ *
+ * Parenteses e colchetes entram na lista porque sem eles um titulo com
+ * "](http://algo) [" fecha o link do embed e abre outro apontando pra onde quiser.
+ * A barra invertida vem primeiro pra nao escapar o escape.
+ */
 export function escapeMd(text) {
-  return String(text ?? '').replace(/([*_`~|\[\]])/g, '\$1');
+  return String(text ?? '').replace(/([\\*_`~|[\]()])/g, '\\$1');
 }
 
 export function trackLink(track) {

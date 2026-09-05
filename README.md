@@ -56,7 +56,7 @@ instantaneamente no seu servidor. Vazio = registro global (leva alguns minutos).
 
 | Comando | O que faz |
 | --- | --- |
-| `/play <busca> [agora]` | Nome da música, link do YouTube (vídeo ou playlist) ou link do Spotify (faixa/álbum/playlist/artista). `agora: true` coloca no topo da fila |
+| `/play <busca> [agora]` | Nome da música (com sugestões enquanto digita), link do YouTube (vídeo ou playlist) ou link do Spotify (faixa/álbum/playlist/artista). `agora: true` coloca no topo da fila |
 | `/pause` · `/resume` | Pausa e retoma |
 | `/skip [quantidade]` | Pula a atual (ou N faixas de uma vez) |
 | `/stop` | Limpa a fila e sai do canal |
@@ -101,6 +101,35 @@ para o próximo da lista. Quando o YouTube quebrar o `android`, é uma linha no 
 Quer áudio Opus de verdade (audio-only, ~130kbps)? Preencha `YTDLP_COOKIES_FROM_BROWSER`
 e ponha `default` na frente da lista: com sessão autenticada os formatos audio-only
 voltam a funcionar.
+
+### Autocomplete e latencia
+Buscar video no yt-dlp durante a digitacao e impossivel: a busca leva ~2,5s (sendo
+**1,1s so de startup do processo**) e o token de uma interacao do Discord vale 3s.
+Medido nesta maquina, `ytsearch1` e `ytsearch8` custam o mesmo — o gargalo e o
+startup, nao a quantidade de resultados.
+
+Por isso o `/play` usa duas camadas:
+1. **Sugestao** — endpoint de sugestao do YouTube (~350ms, ~700 bytes por consulta).
+   Devolve texto, nao video. A primeira opcao da lista e sempre o que voce digitou.
+   O `AUTOCOMPLETE_DEBOUNCE` garante uma consulta por *pausa* na digitacao, nao por tecla.
+2. **Prefetch** — junto da sugestao, o yt-dlp busca a query em background e guarda no
+   cache. Quando voce da enter, o `/play` acha pronto: medido em **1ms** contra ~2300ms
+   sem cache. Se voce apertar enter no meio do prefetch, o `/play` espera a *mesma*
+   busca em vez de subir um segundo yt-dlp.
+
+A fila tambem faz prefetch da proxima faixa enquanto a atual toca, o que tira a busca
+do caminho critico na troca de musica (importa em playlist do Spotify, onde cada faixa
+precisa ser resolvida no YouTube).
+
+### Banda
+Duas medicoes explicam o consumo: o unico formato que baixa sem cookies e o **18**
+(202kbps, video 360p junto), contra 143kbps do opus audio-only — que hoje da 403 em
+*todos* os clients sem sessao autenticada.
+
+O que mais pesava, porem, era a **falta de teto de taxa**: sem `--limit-rate` o yt-dlp
+baixa na velocidade maxima do link, e cada musica comecava saturando a conexao.
+`YTDLP_LIMIT_RATE=128K` (1 Mbps) da 5x de folga sobre os 202kbps necessarios e acaba
+com os picos. Para cair de vez pra 143kbps sem video, preencha `YTDLP_COOKIES_FROM_BROWSER`.
 
 ### Scrobble (Last.fm)
 - Cada usuário conecta sua própria conta; a *session key* fica em `data/users.json`
@@ -150,6 +179,7 @@ Erros lançados como `UserError` viram mensagem amigável e efêmera automaticam
 | `Sign in to confirm you're not a bot` | YouTube pedindo cookies → preencha `YTDLP_COOKIES_FROM_BROWSER=chrome` (feche o navegador antes) ou exporte um `cookies.txt` em `YTDLP_COOKIES_FILE` |
 | Entra no canal mas sai som nenhum | falta permissão de *Falar*, ou o canal é um *Stage* sem o bot como speaker |
 | Playlist do Spotify dá 404 | playlists **editoriais/algorítmicas** (Discover Weekly, Top 50…) são bloqueadas pela API para apps novos; playlists de usuário funcionam |
+| `Unknown interaction` (10062) no log | a interação chegou depois dos 3s de validade do token → o bot descarta e registra o atraso em ms. Se vier junto de `shard N retomou a sessão com X evento(s) reenviados`, foi queda de rede/gateway: os eventos atrasados são reenviados no resume |
 | Comandos não aparecem | rode `npm run deploy`; global demora, use `DISCORD_GUILD_ID` |
 | Scrobble não aparece no perfil | precisa passar de metade da faixa, estar no canal de voz e com `/lastfm status` mostrando *ligado* |
 | Faixa começa e morre em ~30s | yt-dlp desatualizado → `yt-dlp -U` |

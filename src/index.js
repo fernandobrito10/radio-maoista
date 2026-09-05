@@ -1,3 +1,6 @@
+import { writeFile } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import ffmpegPath from 'ffmpeg-static';
 import {
   ChannelType,
@@ -8,8 +11,9 @@ import {
   MessageFlags,
   OAuth2Scopes,
   PermissionsBitField,
+  Status,
 } from 'discord.js';
-import { assertDiscordConfig, config, features } from './config.js';
+import { assertDiscordConfig, config, features, logGateway } from './config.js';
 import { manager } from './core/PlayerManager.js';
 import { loadCommands } from './loadCommands.js';
 import { checkAvailable } from './services/ytdlp.js';
@@ -43,11 +47,44 @@ log.info(`Comandos carregados: ${[...client.commands.keys()].map((c) => `/${c}`)
 
 // ---------------------------------------------------------------- interacoes
 
+// Erros que significam "a interacao morreu", nao bug nosso: nao vale stack trace.
+const DEAD_INTERACTION = new Set([
+  10062, // Unknown interaction (token de 3s expirou)
+  40060, // Interaction has already been acknowledged
+  10008, // Unknown message (resposta ja apagada)
+]);
+
+const INTERACTION_TOKEN_MS = 3_000;
+
 client.on(Events.InteractionCreate, async (interaction) => {
+  // Autocomplete tem token curto e chega uma vez por tecla: responde e sai.
+  if (interaction.isAutocomplete()) {
+    const handler = client.commands.get(interaction.commandName)?.autocomplete;
+    if (!handler) return;
+    try {
+      await handler(interaction);
+    } catch (err) {
+      if (!DEAD_INTERACTION.has(err.code)) {
+        log.debug(`autocomplete /${interaction.commandName}: ${err.message}`);
+      }
+    }
+    return;
+  }
+
   if (!interaction.isChatInputCommand()) return;
 
   const command = client.commands.get(interaction.commandName);
   if (!command) return;
+
+  // O Discord invalida o token 3s depois de criar a interacao. Se ela chegou
+  // atrasada (gateway reconectando, rede caindo, processo travado), qualquer
+  // resposta falha com 10062 — melhor registrar o atraso do que tentar e explodir.
+  const ageMs = Date.now() - interaction.createdTimestamp;
+  if (ageMs >= INTERACTION_TOKEN_MS) {
+    log.warn(`/${interaction.commandName} descartado: a interacao chegou ${ageMs}ms depois de criada `
+      + `(o token vale ${INTERACTION_TOKEN_MS}ms). Gateway reconectando, rede instavel ou processo travado.`);
+    return;
+  }
 
   if (!interaction.inGuild()) {
     await interaction.reply({
@@ -60,6 +97,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
   try {
     await command.execute(interaction);
   } catch (err) {
+    if (DEAD_INTERACTION.has(err.code)) {
+      const age = Date.now() - interaction.createdTimestamp;
+      log.warn(`/${interaction.commandName}: a interacao expirou antes da resposta `
+        + `(${err.code} ${err.rawError?.message ?? ''}, idade ${age}ms). Nao ha o que responder.`);
+      return;
+    }
+
     const isUserError = err instanceof UserError;
     if (isUserError) log.debug(`/${interaction.commandName}: ${err.message}`);
     else log.error(`Erro em /${interaction.commandName}:`, err);
@@ -102,9 +146,90 @@ client.on(Events.VoiceStateUpdate, (oldState, newState) => {
   if (!channel) return;
 
   const humans = channel.members.filter((m) => !m.user.bot).size;
-  if (humans === 0) queue.scheduleLeaveIfAlone();
-  else queue.cancelLeave();
+  queue.setAlone(humans === 0);
 });
+
+// ------------------------------------------------------------ saude do gateway
+// Sem isso, uma reconexao passa invisivel e reaparece como "Unknown interaction":
+// no resume o Discord reenvia os eventos perdidos, e interacoes de antes da queda
+// chegam com o token de 3s ja vencido. O contador de eventos reenviados denuncia.
+
+client.on(Events.ShardDisconnect, (event, id) => {
+  log.warn(`shard ${id} desconectou (codigo ${event?.code ?? '?'}); tentando reconectar`);
+});
+
+client.on(Events.ShardReconnecting, (id) => {
+  log.warn(`shard ${id} reconectando ao gateway`);
+});
+
+client.on(Events.ShardResume, (id, replayedEvents) => {
+  log.warn(`shard ${id} retomou a sessao com ${replayedEvents} evento(s) reenviados`
+    + `${replayedEvents > 0 ? ' — interacoes nesse lote podem chegar expiradas' : ''}`);
+});
+
+client.on(Events.ShardError, (err, id) => {
+  log.warn(`shard ${id} erro de websocket: ${err.message}`);
+});
+
+client.on(Events.ShardReady, (id) => {
+  // ping so existe depois do primeiro heartbeat com ACK; no ready ainda e -1
+  const ping = client.ws.ping;
+  log.info(`shard ${id} pronto${ping >= 0 ? ` (ping ${ping}ms)` : ''}`);
+});
+
+client.on(Events.Warn, (message) => log.warn(`discord.js: ${message}`));
+client.on(Events.Error, (err) => log.error('discord.js:', err));
+
+// LOG_GATEWAY=1: mostra so as linhas que explicam uma reconexao. Se os heartbeats
+// saem e nenhum ACK volta, o problema esta no caminho do websocket, nao no bot.
+if (logGateway) {
+  const RELEVANT = /heartbeat|hello|resum|identif|session|invalid|clos|zombie|reconnect|ready/i;
+  client.on(Events.Debug, (message) => {
+    if (RELEVANT.test(message)) log.info(`gateway: ${String(message).replace(/\s+/g, ' ').trim()}`);
+  });
+}
+
+// Se o event loop travar mais que o intervalo de heartbeat (~41s), o Discord
+// derruba a conexao. Este watchdog separa "nosso processo travou" de "a rede caiu".
+const LAG_TICK_MS = 5_000;
+let lastTick = Date.now();
+const lagWatchdog = setInterval(() => {
+  const drift = Date.now() - lastTick - LAG_TICK_MS;
+  lastTick = Date.now();
+  if (drift > 1_000) log.warn(`event loop travou ${drift}ms (acima de ~41s o gateway derruba a conexao)`);
+}, LAG_TICK_MS);
+lagWatchdog.unref();
+
+// ----------------------------------------------------- liveness / anti-zumbi
+// Close codes fatais (4004 token, 4013/4014 intents) fazem o shard desistir de
+// reconectar — e o processo continua vivo por causa dos timers. Pro Docker o
+// container esta "Up"; pra quem usa, o bot sumiu. Aqui o arquivo de liveness so
+// e tocado com o shard Ready, e depois de 5min sem gateway o processo sai.
+const LIVENESS_FILE = process.env.LIVENESS_FILE
+  || path.join(os.tmpdir(), 'radio-maoista-alive');
+const LIVENESS_TICK_MS = 30_000;
+const MAX_OFFLINE_MS = 5 * 60_000;
+let offlineSince = null;
+
+const livenessWatchdog = setInterval(() => {
+  if (client.ws.status === Status.Ready) {
+    offlineSince = null;
+    writeFile(LIVENESS_FILE, String(Date.now())).catch((err) => {
+      log.debug(`nao consegui escrever o arquivo de liveness: ${err.message}`);
+    });
+    return;
+  }
+
+  offlineSince ??= Date.now();
+  const offlineMs = Date.now() - offlineSince;
+  if (offlineMs >= MAX_OFFLINE_MS) {
+    log.error(`gateway fora do ar ha ${Math.round(offlineMs / 1000)}s (status ${client.ws.status}); `
+      + 'encerrando pro supervisor reiniciar.');
+    manager.destroyAll();
+    process.exit(1);
+  }
+}, LIVENESS_TICK_MS);
+livenessWatchdog.unref();
 
 // ------------------------------------------------------------------- startup
 
@@ -149,8 +274,28 @@ function shutdown(signal) {
 
 process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('unhandledRejection', (reason) => log.error('Promise rejeitada sem catch:', reason));
-process.on('uncaughtException', (err) => log.error('Excecao nao tratada:', err));
+// Um processo que sobrevive a uma excecao nao tratada fica com estado meio
+// destruido: online pro Docker, mudo pra quem usa. Com restart: unless-stopped,
+// morrer e reiniciar limpo e o comportamento correto.
+process.on('uncaughtException', (err) => {
+  log.error('Excecao nao tratada, encerrando pro supervisor reiniciar:', err);
+  try {
+    manager.destroyAll();
+  } catch {
+    // ja estamos caindo
+  }
+  process.exit(1);
+});
+
+process.on('unhandledRejection', (reason) => {
+  log.error('Promise rejeitada sem catch, encerrando pro supervisor reiniciar:', reason);
+  try {
+    manager.destroyAll();
+  } catch {
+    // ja estamos caindo
+  }
+  process.exit(1);
+});
 
 try {
   await client.login(config.discord.token);

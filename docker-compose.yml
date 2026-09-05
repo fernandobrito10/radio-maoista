@@ -18,6 +18,17 @@ services:
     volumes:
       # session keys do Last.fm — precisa persistir entre recriacoes
       - ./data:/app/data
+    # Sem teto, uma rajada de yt-dlp derruba o HOST (o Pi inteiro), nao so o bot:
+    # quem escolhe a vitima passa a ser o OOM killer, e pode ser o sshd.
+    mem_limit: 700m
+    pids_limit: 256
+    cpus: 2.0
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # o shutdown precisa de folga pra sair do canal de voz antes de morrer
+    stop_grace_period: 20s
     # SD card nao gosta de log infinito
     logging:
       driver: json-file

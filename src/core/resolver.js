@@ -1,6 +1,7 @@
 import { config, features } from '../config.js';
 import { parseSpotifyUrl, spotify, SpotifyError } from '../services/spotify.js';
 import * as ytdlp from '../services/ytdlp.js';
+import { cachedSearch } from './searchCache.js';
 import { log } from '../utils/logger.js';
 
 const YT_HOST = /^(www\.|m\.|music\.)?(youtube\.com|youtube-nocookie\.com|youtu\.be)$/i;
@@ -26,7 +27,10 @@ function classify(input) {
     const isPlaylistPage = url.pathname === '/playlist' || (url.searchParams.has('list') && !url.searchParams.has('v') && url.pathname !== '/watch');
     return { kind: isPlaylistPage ? 'yt-playlist' : 'yt-video' };
   }
-  if (url.protocol === 'http:' || url.protocol === 'https:') return { kind: 'url' };
+  // Qualquer outra URL http(s) iria pro extractor generico do yt-dlp, ou seja: o
+  // bot (dentro da rede de casa) buscaria o host que o usuario mandasse. Isso da
+  // um scanner de LAN via /play, com o titulo do embed como canal de retorno.
+  if (url.protocol === 'http:' || url.protocol === 'https:') return { kind: 'link-nao-suportado' };
   return { kind: 'search' };
 }
 
@@ -82,21 +86,23 @@ export async function resolveQuery(input, { requestedBy }) {
       };
     }
 
-    case 'yt-video':
-    case 'url': {
+    case 'yt-video': {
       const track = await ytdlp.getVideo(raw);
       return { kind: 'track', tracks: stamp([track]) };
     }
 
+    case 'link-nao-suportado':
+      throw new ResolveError('So aceito links do YouTube e do Spotify. '
+        + 'Pra outras coisas, manda o nome da musica que eu procuro.');
+
     default: {
-      const results = await ytdlp.search(raw, 1);
+      // cachedSearch: se o autocomplete ja esquentou essa query, sai instantaneo
+      const results = await cachedSearch(raw, 1);
       if (!results.length) throw new ResolveError(`Nao achei nada no YouTube pra **${raw}**.`);
       return { kind: 'search', tracks: stamp(results) };
     }
   }
 }
-
-const ytCache = new Map(); // query -> { url, title, author, durationMs, thumbnail }
 
 /**
  * Garante que a track tem um URL tocavel.
@@ -106,15 +112,10 @@ export async function ensurePlayable(track) {
   if (track.url) return track;
 
   const query = track.query ?? `${track.author} ${track.title}`.trim();
-  const key = query.toLowerCase();
-
-  if (ytCache.has(key)) {
-    return Object.assign(track, ytCache.get(key));
-  }
 
   log.debug(`Resolvendo no YouTube: ${query}`);
-  let results = await ytdlp.search(`${query} audio`, 1);
-  if (!results.length) results = await ytdlp.search(query, 1);
+  let results = await cachedSearch(`${query} audio`, 1);
+  if (!results.length) results = await cachedSearch(query, 1);
   if (!results.length) throw new ResolveError(`Nao achei "${query}" no YouTube.`);
 
   const found = results[0];
@@ -125,7 +126,5 @@ export async function ensurePlayable(track) {
     thumbnail: track.thumbnail ?? found.thumbnail,
     youtubeTitle: found.title,
   };
-  if (ytCache.size > 500) ytCache.clear();
-  ytCache.set(key, patch);
   return Object.assign(track, patch);
 }

@@ -3,6 +3,8 @@ import { config, features } from '../config.js';
 import { log } from '../utils/logger.js';
 
 const API = 'https://ws.audioscrobbler.com/2.0/';
+/** Sem timeout o undici espera ate 300s e a interacao do Discord morre antes. */
+const TIMEOUT_MS = 8_000;
 
 export class LastfmError extends Error {
   constructor(message, code = null) {
@@ -33,9 +35,15 @@ async function call(method, params = {}, { post = false } = {}) {
   payload.format = 'json';
 
   const body = new URLSearchParams(payload);
+  const signal = AbortSignal.timeout(TIMEOUT_MS);
   const res = post
-    ? await fetch(API, { method: 'POST', body, headers: { 'Content-Type': 'application/x-www-form-urlencoded' } })
-    : await fetch(`${API}?${body.toString()}`);
+    ? await fetch(API, {
+      method: 'POST',
+      body,
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      signal,
+    })
+    : await fetch(`${API}?${body.toString()}`, { signal });
 
   const json = await res.json().catch(() => null);
   if (!json) throw new LastfmError(`Resposta invalida do Last.fm (HTTP ${res.status}).`);
