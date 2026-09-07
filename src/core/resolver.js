@@ -77,7 +77,14 @@ export async function resolveQuery(input, { requestedBy }) {
 
     case 'yt-playlist': {
       const playlist = await ytdlp.getPlaylist(raw, limit);
-      if (!playlist.tracks.length) throw new ResolveError('Nao achei nenhum video nessa playlist.');
+      if (!playlist.tracks.length) {
+        const d = playlist.diagnostico ?? {};
+        log.warn(`playlist vazia: ${raw} | entradas=${d.entradas} descartadas=${d.descartadas} | ${d.aviso ?? ''}`);
+        throw new ResolveError('Nao achei nenhum video nessa playlist. '
+          + (d.entradas ? `O YouTube listou ${d.entradas} item(ns), mas nenhum era tocavel.`
+            : 'O YouTube nao listou nenhum item — costuma ser mix/radio (list=RD...), '
+              + 'playlist privada, ou o IP do servidor bloqueado.'));
+      }
       return {
         kind: 'playlist',
         playlistName: playlist.title,

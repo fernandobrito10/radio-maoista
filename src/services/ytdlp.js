@@ -5,7 +5,7 @@ import { log } from '../utils/logger.js';
 
 const AUDIO_FORMAT = 'bestaudio[acodec=opus]/bestaudio[ext=m4a]/bestaudio/best';
 
-const BASE_ARGS = ['--ignore-config', '--no-warnings', '--no-color', '--no-progress'];
+const BASE_ARGS = ['--ignore-config', '--no-color', '--no-progress'];
 
 /**
  * Fila de concorrencia para as chamadas curtas (busca e metadados).
@@ -51,6 +51,11 @@ export class YtDlpError extends Error {
 
 /** Roda o yt-dlp e devolve o stdout completo (pra chamadas de metadados). */
 async function run(args, options = {}) {
+  const { stdout } = await runWithStderr(args, options);
+  return stdout;
+}
+
+async function runWithStderr(args, options = {}) {
   await acquireSlot();
   try {
     return await runUnthrottled(args, options);
@@ -105,7 +110,7 @@ function runUnthrottled(args, { timeoutMs = 60_000 } = {}) {
         reject(new YtDlpError(`yt-dlp saiu com codigo ${code}.`, { stderr, code }));
         return;
       }
-      resolve(Buffer.concat(out).toString('utf8'));
+      resolve({ stdout: Buffer.concat(out).toString('utf8'), stderr });
     });
   });
 }
@@ -189,9 +194,15 @@ export async function getVideo(url) {
   return toTrack(info);
 }
 
-/** Itens de uma playlist do YouTube (modo flat, so metadados basicos). */
+/**
+ * Itens de uma playlist do YouTube (modo flat, so metadados basicos).
+ *
+ * Devolve tambem por que faixas foram descartadas: uma playlist que volta vazia
+ * (mix/radio, privada, ou IP bloqueado pelo YouTube) so dizia "nao achei nenhum
+ * video" e a causa ficava escondida atras do --no-warnings.
+ */
 export async function getPlaylist(url, limit = config.player.maxQueueSize) {
-  const stdout = await run([
+  const { stdout, stderr } = await runWithStderr([
     '--flat-playlist',
     '--dump-single-json',
     '--playlist-end', String(limit),
@@ -200,10 +211,17 @@ export async function getPlaylist(url, limit = config.player.maxQueueSize) {
 
   const info = JSON.parse(stdout);
   const entries = Array.isArray(info.entries) ? info.entries : [];
+  const tracks = entries.filter((e) => e?.id).map((e) => toTrack(e));
+
   return {
     title: info.title ?? 'Playlist',
     url: info.webpage_url ?? url,
-    tracks: entries.filter((e) => e?.id && e?.duration !== 0).map((e) => toTrack(e)),
+    tracks,
+    diagnostico: {
+      entradas: entries.length,
+      descartadas: entries.length - tracks.length,
+      aviso: stderr.split('\n').filter((l) => l.trim()).slice(-2).join(' | '),
+    },
   };
 }
 
