@@ -46,9 +46,8 @@ export async function execute(interaction) {
   // faixa unica que ja vai tocar: o embed de "tocando agora" vira a propria resposta
   let responder = null;
   if (isSingle && startingNow) {
-    responder = queue.useResponder(async (embed) => {
-      await interaction.editReply({ embeds: [embed] });
-    });
+    // devolve a Message pra fila poder apagar esse "tocando agora" na proxima faixa
+    responder = queue.useResponder((embed) => interaction.editReply({ embeds: [embed] }));
   }
 
   if (!isSingle) {

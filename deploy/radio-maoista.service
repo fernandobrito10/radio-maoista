@@ -1,0 +1,57 @@
+[Unit]
+Description=Radio Maoista - bot de musica do Discord
+Documentation=https://github.com/yt-dlp/yt-dlp/wiki
+After=network-online.target
+Wants=network-online.target
+
+# Sem isso, um erro de configuracao (token invalido, por exemplo) vira crash loop
+# e o systemd desiste em 5 tentativas seguidas, deixando o servico em "failed".
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+
+# TROQUE pelo usuario que roda o bot (nao use root).
+User=gustavo-server
+Group=gustavo-server
+WorkingDirectory=/home/gustavo-server/radio-maoista
+
+# O .env NAO entra como EnvironmentFile de proposito: o proprio bot carrega ele
+# via dotenv a partir do WorkingDirectory. O formato do systemd difere do dotenv
+# em quoting e escapes, e duplicar isso so cria divergencia silenciosa.
+# Use Environment= aqui apenas para o que e especifico da maquina:
+Environment=NODE_ENV=production
+Environment=LIVENESS_FILE=/tmp/radio-maoista-alive
+
+# Confirme o caminho com: which node
+ExecStart=/usr/bin/node src/index.js
+
+Restart=always
+RestartSec=5s
+
+# O shutdown sai do canal de voz e mata os processos do yt-dlp antes de morrer.
+KillSignal=SIGTERM
+TimeoutStopSec=20s
+
+# Espelha os limites do docker-compose: uma rajada de yt-dlp nao pode levar o
+# servidor inteiro junto.
+MemoryMax=700M
+TasksMax=256
+
+# Endurecimento que nao atrapalha este bot. ProtectHome fica de fora porque o
+# projeto vive em /home; PrivateTmp da um /tmp proprio, onde o yt-dlp standalone
+# se descompacta a cada execucao.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=radio-maoista
+
+[Install]
+WantedBy=multi-user.target

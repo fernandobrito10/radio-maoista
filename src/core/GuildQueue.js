@@ -48,6 +48,8 @@ export class GuildQueue {
   #advancing = false;
   #advanceRequested = false;
   #responder = null;
+  /** Mensagem do ultimo "tocando agora", pra apagar quando a proxima faixa entrar. */
+  #lastNowPlaying = null;
   /** Muda a cada faixa; carregamento com geracao velha e descartado. */
   #generation = 0;
   #failureStreak = 0;
@@ -385,7 +387,7 @@ export class GuildQueue {
       volume: this.volume,
       loop: this.loop,
       queueSize: this.tracks.length,
-    }));
+    }), { nowPlaying: true });
 
     void scrobbler.nowPlaying(track, this.voiceChannel).catch(() => {});
     this.#startScrobbleWatch(track);
@@ -474,22 +476,51 @@ export class GuildQueue {
     this.#responder = null;
   }
 
-  async #announce(embed) {
+  /**
+   * @param {object} opts
+   * @param {boolean} [opts.nowPlaying] marca o anuncio como "tocando agora", que
+   *   substitui o anterior em vez de empilhar. Erros ficam no canal de proposito.
+   */
+  async #announce(embed, { nowPlaying = false } = {}) {
     const responder = this.#responder;
     this.#responder = null;
+
     if (responder) {
       try {
-        await responder(embed);
+        const message = await responder(embed);
+        if (nowPlaying) await this.#replaceNowPlaying(message);
         return;
       } catch (err) {
         log.debug(`Responder falhou, caindo pro canal de texto: ${err.message}`);
       }
     }
+
     if (!this.textChannel?.isTextBased?.()) return;
     try {
-      await this.textChannel.send({ embeds: [embed] });
+      const message = await this.textChannel.send({ embeds: [embed] });
+      if (nowPlaying) await this.#replaceNowPlaying(message);
     } catch (err) {
       log.debug(`Nao consegui anunciar no canal de texto: ${err.message}`);
+    }
+  }
+
+  /**
+   * Mantem um unico "tocando agora" no canal: o novo entra e o anterior sai.
+   * Numa playlist longa, um embed por faixa virava uma parede de mensagens.
+   *
+   * Apaga DEPOIS de postar o novo, pra nao existir um instante sem nada no canal.
+   * Falha e so debug: a mensagem pode ter sido apagada na mao, ter mais de 14 dias,
+   * ou o bot ter perdido acesso ao canal — nada disso justifica atrapalhar a musica.
+   */
+  async #replaceNowPlaying(message) {
+    const anterior = this.#lastNowPlaying;
+    this.#lastNowPlaying = message ?? null;
+
+    if (!anterior || anterior.id === message?.id) return;
+    try {
+      await anterior.delete();
+    } catch (err) {
+      log.debug(`nao consegui apagar o "tocando agora" anterior: ${err.message}`);
     }
   }
 
