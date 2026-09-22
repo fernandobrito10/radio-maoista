@@ -51,7 +51,8 @@ try {
 // buscar funciona mesmo quando o download da midia da 403 — testa o stream de verdade
 if (probeUrl) {
   try {
-    const source = await openAudioStream(probeUrl);
+    const source = openAudioStream(probeUrl);
+    await source.ready;
     source.kill();
     ok(`stream de audio abriu (player_client=${source.client})`);
   } catch (err) {

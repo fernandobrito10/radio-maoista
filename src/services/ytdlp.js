@@ -226,11 +226,16 @@ export async function getPlaylist(url, limit = config.player.maxQueueSize) {
 }
 
 /**
- * Tenta abrir o audio com um client especifico do YouTube.
- * So resolve quando os primeiros bytes chegam de verdade — assim um 403 na midia
- * (que o yt-dlp so descobre depois de extrair) vira rejeicao, nao um stream vazio.
+ * Tenta abrir o audio com um client especifico do YouTube, escrevendo no
+ * PassThrough recebido. So resolve quando os primeiros bytes chegam de verdade —
+ * assim um 403 na midia (que o yt-dlp so descobre depois de extrair) vira
+ * rejeicao, nao um stream vazio.
+ *
+ * O destino e compartilhado entre as tentativas: um client que falha nao escreveu
+ * nada, entao o proximo reaproveita o mesmo buffer — e quem ja esta lendo (o
+ * ffmpeg) nao percebe a troca.
  */
-function openWithClient(url, client, { firstByteTimeoutMs = 20_000 } = {}) {
+function openWithClient(url, client, out, { firstByteTimeoutMs = 20_000 } = {}) {
   const args = [
     ...BASE_ARGS,
     ...cookieArgs(),
@@ -248,7 +253,6 @@ function openWithClient(url, client, { firstByteTimeoutMs = 20_000 } = {}) {
 
   return new Promise((resolve, reject) => {
     const child = spawn(config.ytdlp.path, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
-    const out = new PassThrough({ highWaterMark: 1 << 20 });
     const stderrChunks = [];
     let gotBytes = false;
     let settled = false;
@@ -256,7 +260,6 @@ function openWithClient(url, client, { firstByteTimeoutMs = 20_000 } = {}) {
     const kill = () => {
       child.killedByUs = true;
       if (!child.killed) child.kill('SIGKILL');
-      out.destroy();
     };
 
     const stderrTail = () => Buffer.concat(stderrChunks).toString('utf8').slice(-600).trim();
@@ -271,7 +274,9 @@ function openWithClient(url, client, { firstByteTimeoutMs = 20_000 } = {}) {
 
     const timer = setTimeout(() => fail(`o yt-dlp nao entregou audio em ${firstByteTimeoutMs / 1000}s`), firstByteTimeoutMs);
 
-    child.stdout.pipe(out);
+    // end: false porque uma tentativa que falha nao pode fechar o destino —
+    // o proximo client precisa do mesmo PassThrough aberto.
+    child.stdout.pipe(out, { end: false });
 
     // "readable" avisa que tem dado no buffer sem consumir — quem le e o player.
     // Atencao: ele tambem dispara no EOF, e um yt-dlp que morreu de 403 fecha o
@@ -283,7 +288,9 @@ function openWithClient(url, client, { firstByteTimeoutMs = 20_000 } = {}) {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      resolve({ process: child, stream: out, kill, client });
+      // deu certo: agora o fim do processo fecha o destino de verdade
+      child.stdout.once('end', () => out.end());
+      resolve({ process: child, kill, client });
     };
     out.on('readable', onReadable);
 
@@ -308,21 +315,52 @@ function openWithClient(url, client, { firstByteTimeoutMs = 20_000 } = {}) {
 }
 
 /**
- * Abre o audio tentando os clients de YOUTUBE_PLAYER_CLIENTS em ordem.
- * Devolve { process, stream, kill } — quem chama e responsavel por chamar kill().
+ * Abre o audio tentando os clients de YTDLP_PLAYER_CLIENTS em ordem.
+ *
+ * Devolve NA HORA `{ stream, ready, kill }`: o stream ja pode ser entregue ao
+ * createAudioResource, e `ready` so resolve quando os primeiros bytes chegam.
+ * Isso deixa o ffmpeg subir em paralelo com a extracao do yt-dlp, em vez de
+ * esperar ela terminar — medido em ~2s de startup que antes eram sequenciais.
+ *
+ * Quem chama e responsavel por chamar kill().
  */
-export async function openAudioStream(url) {
+export function openAudioStream(url) {
   const clients = config.ytdlp.playerClients.length ? config.ytdlp.playerClients : ['android'];
-  const failures = [];
+  const out = new PassThrough({ highWaterMark: 1 << 20 });
+  let atual = null;
+  let desistiu = false;
 
-  for (const client of clients) {
-    try {
-      return await openWithClient(url, client);
-    } catch (err) {
-      failures.push(`${client}: ${err.message}`);
-      log.warn(`player_client=${client} falhou (${err.message})${err.stderr ? ` | ${err.stderr.split('\n').pop()}` : ''}`);
+  const ready = (async () => {
+    const failures = [];
+
+    for (const client of clients) {
+      if (desistiu) throw new YtDlpError('carregamento cancelado');
+      try {
+        atual = await openWithClient(url, client, out);
+        return atual;
+      } catch (err) {
+        failures.push(`${client}: ${err.message}`);
+        log.warn(`player_client=${client} falhou (${err.message})${err.stderr ? ` | ${err.stderr.split('\n').pop()}` : ''}`);
+      }
     }
-  }
 
-  throw new YtDlpError(`nenhum client do YouTube conseguiu o audio — ${failures.join('; ')}`);
+    out.end();
+    throw new YtDlpError(`nenhum client do YouTube conseguiu o audio — ${failures.join('; ')}`);
+  })();
+
+  // se quem chamou desistir antes de esperar, a rejeicao ja tem dono
+  ready.catch(() => {});
+
+  return {
+    stream: out,
+    ready,
+    get client() {
+      return atual?.client ?? null;
+    },
+    kill() {
+      desistiu = true;
+      atual?.kill();
+      out.destroy();
+    },
+  };
 }

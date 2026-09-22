@@ -25,13 +25,18 @@ export async function execute(interaction) {
   const query = interaction.options.getString('busca', true);
   const playNext = interaction.options.getBoolean('agora') ?? false;
 
-  const result = await resolveQuery(query, { requestedBy: interaction.user.id });
-
-  const queue = await manager.ensure({
+  // Entrar no canal de voz e resolver a busca sao independentes: em serie somavam
+  // o handshake de voz com os ~2,5s do yt-dlp. Em paralelo, paga-se so o maior.
+  const conexao = manager.ensure({
     guild: interaction.guild,
     voiceChannel,
     textChannel: interaction.channel,
   });
+  // sem isto, uma busca que falha antes da conexao deixa a rejeicao sem dono
+  conexao.catch(() => {});
+
+  const result = await resolveQuery(query, { requestedBy: interaction.user.id });
+  const queue = await conexao;
 
   const startingNow = !queue.current && !queue.isPlaying && !queue.isPaused;
   const isSingle = result.tracks.length === 1;

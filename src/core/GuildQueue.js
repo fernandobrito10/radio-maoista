@@ -350,11 +350,9 @@ export class GuildQueue {
 
     this.#killStream();
 
-    const source = await openAudioStream(track.url);
-    if (!stillValid()) {
-      source.kill();
-      throw new PlaybackCancelled();
-    }
+    // O stream vem na hora e o ffmpeg comeca a subir ja; os primeiros bytes (e o
+    // fallback entre clients do YouTube) sao esperados depois, em paralelo.
+    const source = openAudioStream(track.url);
     this.ytProcess = source;
 
     const resource = createAudioResource(source.stream, {
@@ -363,6 +361,19 @@ export class GuildQueue {
       metadata: track,
     });
     resource.volume?.setVolume(this.volume / 100);
+
+    try {
+      await source.ready;
+    } catch (err) {
+      source.kill();
+      if (!stillValid()) throw new PlaybackCancelled();
+      throw err;
+    }
+
+    if (!stillValid()) {
+      source.kill();
+      throw new PlaybackCancelled();
+    }
 
     this.resource = resource;
     this.playbackStartedAt = Date.now();
