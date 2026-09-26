@@ -140,7 +140,9 @@ function pickThumbnail(info) {
   if (Array.isArray(info.thumbnails) && info.thumbnails.length) {
     return info.thumbnails[info.thumbnails.length - 1]?.url ?? null;
   }
-  if (info.id) return `https://i.ytimg.com/vi/${info.id}/hqdefault.jpg`;
+  // Montar a URL do ytimg so faz sentido pro YouTube: no SoundCloud o id e
+  // numerico e geraria um link de miniatura quebrado no embed.
+  if (info.id && sourceOf(info) === 'youtube') return `https://i.ytimg.com/vi/${info.id}/hqdefault.jpg`;
   return null;
 }
 
@@ -149,6 +151,13 @@ function videoUrl(info) {
   if (info.url && /^https?:/.test(info.url)) return info.url;
   if (info.id) return `https://www.youtube.com/watch?v=${info.id}`;
   return null;
+}
+
+/** De onde veio a faixa, pelo extractor que o yt-dlp usou. */
+function sourceOf(info) {
+  const extractor = String(info.extractor ?? info.ie_key ?? info.extractor_key ?? '').toLowerCase();
+  if (extractor.startsWith('soundcloud')) return 'soundcloud';
+  return 'youtube';
 }
 
 /** Normaliza um objeto do yt-dlp para o formato interno de track. */
@@ -160,7 +169,7 @@ export function toTrack(info, extra = {}) {
     durationMs: toMs(info.duration),
     thumbnail: pickThumbnail(info),
     isLive: Boolean(info.is_live),
-    source: 'youtube',
+    source: sourceOf(info),
     spotify: null,
     query: null,
     ...extra,
@@ -172,13 +181,22 @@ export async function checkAvailable() {
   return stdout.trim();
 }
 
-/** Busca no YouTube e devolve N resultados (rapido, sem resolver formatos). */
-export async function search(query, limit = 1, { timeoutMs = 30_000 } = {}) {
+/**
+ * Busca por texto. `source` aceita 'youtube' (padrao) ou 'soundcloud'.
+ *
+ * Os dois usam --flat-playlist: uma chamada so, e o resultado ja traz
+ * webpage_url canonica, titulo, uploader e duracao. Extracao completa custaria
+ * uma ida extra a api-v2 do SoundCloud por resultado — que e justamente a parte
+ * lenta e instavel (medido: timeouts de 20s intermitentes).
+ */
+export async function search(query, limit = 1, { timeoutMs = 30_000, source = 'youtube' } = {}) {
+  const alvo = `${source === 'soundcloud' ? 'scsearch' : 'ytsearch'}${limit}:${query}`;
+
   const stdout = await run([
     '--flat-playlist',
     '--dump-json',
     '--playlist-end', String(limit),
-    `ytsearch${limit}:${query}`,
+    alvo,
   ], { timeoutMs });
 
   return parseJsonLines(stdout)

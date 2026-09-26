@@ -4,7 +4,7 @@ import { escapeMd, formatDuration, plural, progressBar, trackLink, truncate } fr
 export const COLOR = 0xe03131;
 export const COLOR_ERROR = 0x8b0000;
 
-const SOURCE_TAG = { spotify: 'Spotify → YouTube', youtube: 'YouTube' };
+const SOURCE_TAG = { spotify: 'Spotify → YouTube', youtube: 'YouTube', soundcloud: 'SoundCloud' };
 
 export function errorEmbed(message) {
   return new EmbedBuilder().setColor(COLOR_ERROR).setDescription(`❌ ${message}`);

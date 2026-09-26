@@ -5,6 +5,7 @@ import { cachedSearch } from './searchCache.js';
 import { log } from '../utils/logger.js';
 
 const YT_HOST = /^(www\.|m\.|music\.)?(youtube\.com|youtube-nocookie\.com|youtu\.be)$/i;
+const SC_HOST = /^(www\.|m\.|on\.|api\.)?soundcloud\.com$/i;
 
 export class ResolveError extends Error {}
 
@@ -27,9 +28,18 @@ function classify(input) {
     const isPlaylistPage = url.pathname === '/playlist' || (url.searchParams.has('list') && !url.searchParams.has('v') && url.pathname !== '/watch');
     return { kind: isPlaylistPage ? 'yt-playlist' : 'yt-video' };
   }
+
+  if (SC_HOST.test(url.hostname)) {
+    const partes = url.pathname.split('/').filter(Boolean);
+    // /usuario/sets/nome = set; /usuario sozinho = perfil (o yt-dlp lista as faixas);
+    // qualquer outra coisa (/usuario/faixa, /tracks/id) e faixa unica
+    const colecao = partes.includes('sets') || partes.length === 1;
+    return { kind: colecao ? 'sc-playlist' : 'sc-track' };
+  }
   // Qualquer outra URL http(s) iria pro extractor generico do yt-dlp, ou seja: o
   // bot (dentro da rede de casa) buscaria o host que o usuario mandasse. Isso da
   // um scanner de LAN via /play, com o titulo do embed como canal de retorno.
+  // Por isso a lista e fechada: YouTube, Spotify e SoundCloud.
   if (url.protocol === 'http:' || url.protocol === 'https:') return { kind: 'link-nao-suportado' };
   return { kind: 'search' };
 }
@@ -38,7 +48,7 @@ function classify(input) {
  * Transforma o texto do /play em uma lista de tracks.
  * Faixas do Spotify entram "nao resolvidas" — o YouTube e buscado na hora de tocar.
  */
-export async function resolveQuery(input, { requestedBy }) {
+export async function resolveQuery(input, { requestedBy, source = 'youtube' }) {
   const raw = String(input ?? '').trim();
   if (!raw) throw new ResolveError('Manda o nome ou o link da musica.');
 
@@ -93,19 +103,37 @@ export async function resolveQuery(input, { requestedBy }) {
       };
     }
 
-    case 'yt-video': {
+    case 'yt-video':
+    case 'sc-track': {
       const track = await ytdlp.getVideo(raw);
       return { kind: 'track', tracks: stamp([track]) };
     }
 
+    case 'sc-playlist': {
+      const set = await ytdlp.getPlaylist(raw, limit);
+      if (!set.tracks.length) {
+        throw new ResolveError('Nao achei faixas nesse link do SoundCloud. '
+          + 'Sets privados ou faixas so pra seguidores nao sao acessiveis.');
+      }
+      return {
+        kind: 'playlist',
+        playlistName: set.title,
+        playlistUrl: set.url,
+        tracks: stamp(set.tracks),
+      };
+    }
+
     case 'link-nao-suportado':
-      throw new ResolveError('So aceito links do YouTube e do Spotify. '
+      throw new ResolveError('So aceito links do YouTube, Spotify e SoundCloud. '
         + 'Pra outras coisas, manda o nome da musica que eu procuro.');
 
     default: {
       // cachedSearch: se o autocomplete ja esquentou essa query, sai instantaneo
-      const results = await cachedSearch(raw, 1);
-      if (!results.length) throw new ResolveError(`Nao achei nada no YouTube pra **${raw}**.`);
+      const results = await cachedSearch(raw, 1, source);
+      if (!results.length) {
+        const onde = source === 'soundcloud' ? 'no SoundCloud' : 'no YouTube';
+        throw new ResolveError(`Nao achei nada ${onde} pra **${raw}**.`);
+      }
       return { kind: 'search', tracks: stamp(results) };
     }
   }
@@ -123,6 +151,7 @@ export async function ensurePlayable(track) {
   log.debug(`Resolvendo no YouTube: ${query}`);
   let results = await cachedSearch(`${query} audio`, 1);
   if (!results.length) results = await cachedSearch(query, 1);
+  // faixas do Spotify sempre resolvem no YouTube: e la que esta o catalogo
   if (!results.length) throw new ResolveError(`Nao achei "${query}" no YouTube.`);
 
   const found = results[0];

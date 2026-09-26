@@ -124,6 +124,8 @@ async function respond(interaction, choices) {
 export async function suggestTracks(interaction) {
   const typed = String(interaction.options.getFocused() ?? '').trim();
   const userId = interaction.user.id;
+  // a fonte ja esta preenchida enquanto a pessoa digita: o prefetch vai pro site certo
+  const source = interaction.options.getString('fonte') ?? 'youtube';
 
   cancelPending(userId);
 
@@ -143,7 +145,7 @@ export async function suggestTracks(interaction) {
   const cached = readCache(typed);
   if (cached) {
     await respond(interaction, cached);
-    if (config.autocomplete.prefetch) primeSearch(typed, 1);
+    if (config.autocomplete.prefetch) primeSearch(typed, 1, source);
     return;
   }
 
@@ -164,7 +166,7 @@ export async function suggestTracks(interaction) {
       }
 
       // esquenta a busca de verdade enquanto a pessoa decide
-      if (config.autocomplete.prefetch) primeSearch(typed, 1);
+      if (config.autocomplete.prefetch) primeSearch(typed, 1, source);
       resolve();
     }, config.autocomplete.debounceMs);
 

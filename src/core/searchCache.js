@@ -9,7 +9,7 @@ const results = new Map();
 /** chave -> Promise<tracks> em andamento */
 const inflight = new Map();
 
-const keyOf = (query, limit) => `${limit}|${query.trim().toLowerCase()}`;
+const keyOf = (query, limit, source) => `${source}|${limit}|${query.trim().toLowerCase()}`;
 
 /**
  * Busca no YouTube com cache e deduplicacao de chamadas simultaneas.
@@ -19,8 +19,8 @@ const keyOf = (query, limit) => `${limit}|${query.trim().toLowerCase()}`;
  * autocomplete ja disparou a busca e a pessoa aperta enter no meio dela, o /play
  * espera a MESMA promise em vez de subir um segundo yt-dlp.
  */
-export async function cachedSearch(query, limit = 1) {
-  const key = keyOf(query, limit);
+export async function cachedSearch(query, limit = 1, source = 'youtube') {
+  const key = keyOf(query, limit, source);
 
   const hit = results.get(key);
   if (hit) {
@@ -37,7 +37,7 @@ export async function cachedSearch(query, limit = 1) {
     return running;
   }
 
-  const promise = search(query, limit)
+  const promise = search(query, limit, { source })
     .then((tracks) => {
       if (results.size >= MAX_ENTRIES) results.delete(results.keys().next().value);
       results.set(key, { at: Date.now(), tracks });
@@ -50,10 +50,10 @@ export async function cachedSearch(query, limit = 1) {
 }
 
 /** Esquenta o cache em background (autocomplete). Nunca lanca. */
-export function primeSearch(query, limit = 1) {
-  const key = keyOf(query, limit);
+export function primeSearch(query, limit = 1, source = 'youtube') {
+  const key = keyOf(query, limit, source);
   if (results.has(key) || inflight.has(key)) return;
-  void cachedSearch(query, limit).catch((err) => {
-    log.debug(`prefetch da busca "${query}" falhou: ${err.message}`);
+  void cachedSearch(query, limit, source).catch((err) => {
+    log.debug(`prefetch da busca "${query}" (${source}) falhou: ${err.message}`);
   });
 }

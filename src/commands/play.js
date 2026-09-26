@@ -7,13 +7,20 @@ import { addedPlaylistEmbed, addedTrackEmbed, errorEmbed } from '../utils/embeds
 
 export const data = new SlashCommandBuilder()
   .setName('play')
-  .setDescription('Toca uma musica: nome, link do YouTube ou link do Spotify (faixa/album/playlist)')
+  .setDescription('Toca uma musica: nome, ou link do YouTube, Spotify ou SoundCloud')
   .addStringOption((o) => o
     .setName('busca')
-    .setDescription('Nome da musica, link do YouTube ou link do Spotify')
+    .setDescription('Nome da musica, ou link do YouTube, Spotify ou SoundCloud')
     .setRequired(true)
     .setMaxLength(500)
     .setAutocomplete(true))
+  .addStringOption((o) => o
+    .setName('fonte')
+    .setDescription('Onde procurar quando voce digita um nome (links sempre usam o site do proprio link)')
+    .addChoices(
+      { name: 'YouTube (padrao)', value: 'youtube' },
+      { name: 'SoundCloud', value: 'soundcloud' },
+    ))
   .addBooleanOption((o) => o
     .setName('agora')
     .setDescription('Coloca no topo da fila em vez do fim'));
@@ -24,6 +31,7 @@ export async function execute(interaction) {
 
   const query = interaction.options.getString('busca', true);
   const playNext = interaction.options.getBoolean('agora') ?? false;
+  const source = interaction.options.getString('fonte') ?? 'youtube';
 
   // Entrar no canal de voz e resolver a busca sao independentes: em serie somavam
   // o handshake de voz com os ~2,5s do yt-dlp. Em paralelo, paga-se so o maior.
@@ -35,7 +43,7 @@ export async function execute(interaction) {
   // sem isto, uma busca que falha antes da conexao deixa a rejeicao sem dono
   conexao.catch(() => {});
 
-  const result = await resolveQuery(query, { requestedBy: interaction.user.id });
+  const result = await resolveQuery(query, { requestedBy: interaction.user.id, source });
   const queue = await conexao;
 
   const startingNow = !queue.current && !queue.isPlaying && !queue.isPaused;
