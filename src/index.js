@@ -16,7 +16,7 @@ import {
 import { assertDiscordConfig, config, features, logGateway } from './config.js';
 import { manager } from './core/PlayerManager.js';
 import { loadCommands } from './loadCommands.js';
-import { checkAvailable } from './services/ytdlp.js';
+import { checkAvailable, sweepStaleTmp } from './services/ytdlp.js';
 import { errorEmbed } from './utils/embeds.js';
 import { UserError } from './utils/guards.js';
 import { log } from './utils/logger.js';
@@ -230,6 +230,12 @@ const livenessWatchdog = setInterval(() => {
   }
 }, LIVENESS_TICK_MS);
 livenessWatchdog.unref();
+
+// Sobras de yt-dlp morto a SIGKILL enchem o /tmp e derrubam a descompactacao
+// do binario standalone (exit 255). Varre no boot e de hora em hora.
+sweepStaleTmp();
+const tmpSweeper = setInterval(() => sweepStaleTmp(), 60 * 60_000);
+tmpSweeper.unref();
 
 // ------------------------------------------------------------------- startup
 

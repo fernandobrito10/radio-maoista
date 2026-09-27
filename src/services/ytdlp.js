@@ -1,7 +1,86 @@
 import { spawn } from 'node:child_process';
+import { mkdirSync, readdirSync, rmSync, statSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { PassThrough } from 'node:stream';
 import { config } from '../config.js';
 import { log } from '../utils/logger.js';
+
+/**
+ * Diretorio temporario exclusivo dos nossos processos yt-dlp.
+ *
+ * O binario standalone e um PyInstaller: a cada execucao ele se descompacta num
+ * `_MEI<aleatorio>` de dezenas de MB e limpa na saida. Quem morre de SIGKILL nao
+ * limpa nada — e o bot matava o yt-dlp assim em todo skip/stop/troca de faixa.
+ * Em dias de uso isso enche o /tmp e a proxima execucao falha com
+ * "Failed to extract ...: decompression resulted in return code -1" (exit 255).
+ *
+ * Isolar num diretorio proprio torna a faxina segura: nada mais escreve aqui.
+ */
+const YTDLP_TMP = path.join(os.tmpdir(), 'radio-maoista-ytdlp');
+
+function ensureTmp() {
+  try {
+    mkdirSync(YTDLP_TMP, { recursive: true });
+  } catch (err) {
+    log.debug(`nao consegui criar ${YTDLP_TMP}: ${err.message}`);
+  }
+}
+ensureTmp();
+
+/** Env dos filhos: igual ao nosso, mas com o temporario redirecionado. */
+function childEnv() {
+  return { ...process.env, TMPDIR: YTDLP_TMP, TEMP: YTDLP_TMP, TMP: YTDLP_TMP };
+}
+
+/**
+ * Remove sobras de execucoes antigas. So mexe no nosso diretorio, e so no que
+ * tem mais de uma hora — assim nunca apaga a extracao de um processo vivo.
+ */
+export function sweepStaleTmp({ maxAgeMs = 60 * 60_000 } = {}) {
+  let removidos = 0;
+  let bytes = 0;
+  try {
+    for (const nome of readdirSync(YTDLP_TMP)) {
+      const alvo = path.join(YTDLP_TMP, nome);
+      try {
+        const st = statSync(alvo);
+        if (Date.now() - st.mtimeMs < maxAgeMs) continue;
+        bytes += st.size;
+        rmSync(alvo, { recursive: true, force: true });
+        removidos += 1;
+      } catch {
+        // sumiu no meio do caminho, ou esta em uso: deixa quieto
+      }
+    }
+  } catch (err) {
+    log.debug(`faxina do temporario falhou: ${err.message}`);
+  }
+  if (removidos) log.info(`limpei ${removidos} sobra(s) de yt-dlp em ${YTDLP_TMP}`);
+  return removidos;
+}
+
+/**
+ * SIGTERM primeiro, SIGKILL so se teimar. O PyInstaller trata SIGTERM e apaga o
+ * proprio `_MEI` antes de sair; com SIGKILL direto, a sobra ficava no disco.
+ */
+function killGracefully(child, graceMs = 3_000) {
+  if (!child || child.exitCode !== null || child.signalCode !== null) return;
+  try {
+    child.kill('SIGTERM');
+  } catch {
+    return;
+  }
+  const t = setTimeout(() => {
+    try {
+      child.kill('SIGKILL');
+    } catch {
+      // ja morreu
+    }
+  }, graceMs);
+  t.unref();
+  child.once('exit', () => clearTimeout(t));
+}
 
 const AUDIO_FORMAT = 'bestaudio[acodec=opus]/bestaudio[ext=m4a]/bestaudio/best';
 
@@ -71,7 +150,7 @@ function runUnthrottled(args, { timeoutMs = 60_000 } = {}) {
   return new Promise((resolve, reject) => {
     let child;
     try {
-      child = spawn(config.ytdlp.path, finalArgs, { windowsHide: true });
+      child = spawn(config.ytdlp.path, finalArgs, { windowsHide: true, env: childEnv() });
     } catch (err) {
       reject(new YtDlpError(`Nao consegui executar "${config.ytdlp.path}": ${err.message}`));
       return;
@@ -84,7 +163,7 @@ function runUnthrottled(args, { timeoutMs = 60_000 } = {}) {
     const timer = setTimeout(() => {
       if (settled) return;
       settled = true;
-      child.kill('SIGKILL');
+      killGracefully(child);
       reject(new YtDlpError('yt-dlp demorou demais para responder (timeout).'));
     }, timeoutMs);
 
@@ -270,14 +349,18 @@ function openWithClient(url, client, out, { firstByteTimeoutMs = 20_000 } = {}) 
   log.debug(`yt-dlp stream (player_client=${client})`, url);
 
   return new Promise((resolve, reject) => {
-    const child = spawn(config.ytdlp.path, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+    const child = spawn(config.ytdlp.path, args, {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+      env: childEnv(),
+    });
     const stderrChunks = [];
     let gotBytes = false;
     let settled = false;
 
     const kill = () => {
       child.killedByUs = true;
-      if (!child.killed) child.kill('SIGKILL');
+      killGracefully(child);
     };
 
     const stderrTail = () => Buffer.concat(stderrChunks).toString('utf8').slice(-600).trim();
